@@ -53,7 +53,11 @@ sudo ./disk_analyzer.sh
    - RAID 盘：先确认风险，再选择 `只读测速`（推荐）或 `读写测速`。
    - 读写测速：会写入 100MB 临时文件，支持缓存策略选择（默认不清缓存）。
 4. **依赖管理（高风险）**：输入 `4` 进入 `smartmontools` 的安装/卸载菜单（系统级操作）。
-5. 随时输入 `q` 退出脚本。
+5. **NVMe 温度观察（低风险）**：输入 `5` 对已选 NVMe 设备进行连续只读监控（支持采样间隔和采样次数配置，`Ctrl+C` 可中断）。
+   - 可选保存 CSV（默认保存），便于后续做趋势分析。
+   - 观察结束后可使用 Python 脚本绘图：
+     - `python3 scripts/plot_nvme_temperature.py --input <csv文件路径>`
+6. 随时输入 `q` 退出脚本。
 
 ## ⚠️ 注意事项
 - RAID 物理盘扫描属于只读查询，通常安全；但扫描结果是控制器级视角，可能不与单个逻辑盘一一对应。
@@ -66,6 +70,17 @@ sudo ./disk_analyzer.sh
 ## 🧪 排查记录
 - NVMe 温度误报排查、交叉验证实验与结论见：
   - [`docs/nvme-temperature-validation.md`](docs/nvme-temperature-validation.md)
+
+## 🗺 规划与待办
+- 后续功能规划见：
+  - [`docs/TODO.md`](docs/TODO.md)
+
+## 📈 可视化
+- 监控数据 CSV 绘图脚本：
+  - `scripts/plot_nvme_temperature.py`
+- 用法示例：
+  - `python3 scripts/plot_nvme_temperature.py --input ./logs/nvme_monitor_nvme0n1_20260228_120000.csv`
+  - 可选输出路径：`--output ./logs/nvme0_plot.png`
 
 ## 📜 许可证
 供技术交流与测试使用。

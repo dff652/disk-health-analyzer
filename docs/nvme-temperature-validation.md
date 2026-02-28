@@ -81,3 +81,6 @@ sudo smartctl -a /dev/nvme0n1 | egrep -i "Temperature:|Temperature Sensor [0-9]|
 3. `nvme1n1` 的可信温度约为 `43C`（三路一致）。
 4. 现已通过代码修复消除跨盘温度误报问题。
 
+## 8. 后续改进
+
+- 详细规划见 `docs/TODO.md`，重点包括阈值告警、趋势图增强、多设备对比与长期监控能力。

@@ -184,6 +184,22 @@ apply_cache_policy() {
     fi
 }
 
+calc_delta() {
+    local cur="$1"
+    local prev="$2"
+    if [[ "$cur" =~ ^[0-9]+$ ]] && [[ "$prev" =~ ^[0-9]+$ ]]; then
+        echo $((cur - prev))
+    else
+        echo "-"
+    fi
+}
+
+csv_escape() {
+    local val="$1"
+    val="${val//\"/\"\"}"
+    printf "\"%s\"" "$val"
+}
+
 # ----------------- RAID 检测与提示 -----------------
 is_raid_model() {
     local model="$1"
@@ -842,6 +858,128 @@ test_speed() {
     echo -e "${GREEN}测试完成！${NC}"
 }
 
+monitor_nvme_temperature() {
+    [ -z "$SELECTED_DISK" ] && { echo -e "${RED}请先选择磁盘！${NC}"; return; }
+    [[ "$SELECTED_DISK" != *"nvme"* ]] && { echo -e "${YELLOW}当前仅支持 NVMe 连续温度观察。${NC}"; return; }
+
+    if ! command -v smartctl &> /dev/null; then
+        echo -e "${RED}错误: 未安装 smartmontools${NC}"
+        echo -e "${YELLOW}请在主菜单 4 手动安装，或通过包管理器安装${NC}"
+        return
+    fi
+
+    local interval samples
+    read -p "采样间隔(秒, 默认5): " interval
+    [ -z "$interval" ] && interval=5
+    if ! [[ "$interval" =~ ^[0-9]+$ ]] || [ "$interval" -le 0 ]; then
+        echo -e "${RED}无效间隔，必须是正整数。${NC}"
+        return
+    fi
+
+    read -p "采样次数(默认12, 输入0表示持续观察): " samples
+    [ -z "$samples" ] && samples=12
+    if ! [[ "$samples" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}无效次数，必须是非负整数。${NC}"
+        return
+    fi
+
+    local prev_warn="" prev_crit="" prev_t1c="" prev_t2c="" prev_t1t="" prev_t2t=""
+    local count=0 stop_monitor=0
+    local prev_int_trap
+    local csv_file=""
+    prev_int_trap=$(trap -p INT)
+    trap 'stop_monitor=1' INT
+
+    read -p "保存采样到 CSV? (Y/n): " save_csv
+    if [[ "$save_csv" != [nN] ]]; then
+        local default_csv="./logs/nvme_monitor_$(basename "$SELECTED_DISK")_$(date +%Y%m%d_%H%M%S).csv"
+        read -p "CSV 路径(默认: ${default_csv}): " csv_input
+        [ -z "$csv_input" ] && csv_input="$default_csv"
+        mkdir -p "$(dirname "$csv_input")" 2>/dev/null
+        csv_file="$csv_input"
+        {
+            echo "timestamp,epoch,disk,model,firmware,critical_warning,composite_c,sensor1_c,sensor2_c,warning_time,critical_time,t1_count,t2_count,t1_time,t2_time,d_warning_time,d_critical_time,d_t1_count,d_t2_count,d_t1_time,d_t2_time"
+        } > "$csv_file"
+    fi
+
+    echo -e "\n${CYAN}--- NVMe 温度连续观察（低风险只读）---${NC}"
+    echo -e "设备: ${YELLOW}$SELECTED_DISK${NC} | 间隔: ${YELLOW}${interval}s${NC} | 次数: ${YELLOW}${samples}${NC}"
+    echo -e "${YELLOW}提示: 可按 Ctrl+C 停止观察并返回主菜单。${NC}"
+    [ -n "$csv_file" ] && echo -e "CSV 输出: ${CYAN}$csv_file${NC}"
+    echo -e "--------------------------------------------------------------------------------"
+
+    while true; do
+        local raw_smart
+        raw_smart=$(smartctl -a "$SELECTED_DISK" 2>/dev/null)
+        if [ -z "$raw_smart" ]; then
+            echo -e "${RED}读取 SMART 失败，观察终止。${NC}"
+            break
+        fi
+
+        local ts epoch cw comp s1 s2 wt ct t1c t2c t1t t2t model firmware
+        ts=$(date '+%F %T')
+        epoch=$(date +%s)
+        cw=$(echo "$raw_smart" | grep -m1 -i "^Critical Warning:" | awk -F: '{print $2}' | xargs)
+        comp=$(echo "$raw_smart" | grep -m1 -i "^Temperature:" | awk -F: '{print $2}' | tr -cd '0-9')
+        s1=$(echo "$raw_smart" | grep -m1 -i "Temperature Sensor 1" | awk -F: '{print $2}' | tr -cd '0-9')
+        s2=$(echo "$raw_smart" | grep -m1 -i "Temperature Sensor 2" | awk -F: '{print $2}' | tr -cd '0-9')
+        model=$(echo "$raw_smart" | grep -m1 -i "Model Number" | awk -F: '{print $2}' | xargs)
+        firmware=$(echo "$raw_smart" | grep -m1 -i "Firmware Version" | awk -F: '{print $2}' | xargs)
+        wt=$(echo "$raw_smart" | grep -m1 -i "Warning Comp. Temperature Time" | awk -F: '{print $2}' | tr -cd '0-9')
+        ct=$(echo "$raw_smart" | grep -m1 -i "Critical Comp. Temperature Time" | awk -F: '{print $2}' | tr -cd '0-9')
+        t1c=$(echo "$raw_smart" | grep -m1 -i "Thermal Management T1 Trans Count" | awk -F: '{print $2}' | tr -cd '0-9')
+        t2c=$(echo "$raw_smart" | grep -m1 -i "Thermal Management T2 Trans Count" | awk -F: '{print $2}' | tr -cd '0-9')
+        t1t=$(echo "$raw_smart" | grep -m1 -i "Thermal Management T1 Total Time" | awk -F: '{print $2}' | tr -cd '0-9')
+        t2t=$(echo "$raw_smart" | grep -m1 -i "Thermal Management T2 Total Time" | awk -F: '{print $2}' | tr -cd '0-9')
+
+        local dwt dct dt1c dt2c dt1t dt2t
+        dwt=$(calc_delta "$wt" "$prev_warn")
+        dct=$(calc_delta "$ct" "$prev_crit")
+        dt1c=$(calc_delta "$t1c" "$prev_t1c")
+        dt2c=$(calc_delta "$t2c" "$prev_t2c")
+        dt1t=$(calc_delta "$t1t" "$prev_t1t")
+        dt2t=$(calc_delta "$t2t" "$prev_t2t")
+
+        echo -e "[${ts}] CW=${cw:-N/A} | Composite=${comp:-N/A}C | Sensor1=${s1:-N/A}C | Sensor2=${s2:-N/A}C"
+        echo -e "           WarnTime=${wt:-N/A}(Δ${dwt}) | CritTime=${ct:-N/A}(Δ${dct}) | T1Cnt=${t1c:-N/A}(Δ${dt1c}) | T2Cnt=${t2c:-N/A}(Δ${dt2c}) | T1Time=${t1t:-N/A}(Δ${dt1t}) | T2Time=${t2t:-N/A}(Δ${dt2t})"
+
+        if [ -n "$csv_file" ]; then
+            {
+                csv_escape "${ts}"; printf ","
+                printf "%s," "${epoch:-}"
+                csv_escape "${SELECTED_DISK}"; printf ","
+                csv_escape "${model:-}"; printf ","
+                csv_escape "${firmware:-}"; printf ","
+                csv_escape "${cw:-}"; printf ","
+                printf "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n" \
+                    "${comp:-}" "${s1:-}" "${s2:-}" "${wt:-}" "${ct:-}" "${t1c:-}" "${t2c:-}" "${t1t:-}" "${t2t:-}" \
+                    "${dwt:-}" "${dct:-}" "${dt1c:-}" "${dt2c:-}" "${dt1t:-}" "${dt2t:-}"
+            } >> "$csv_file"
+        fi
+
+        prev_warn="$wt"; prev_crit="$ct"; prev_t1c="$t1c"; prev_t2c="$t2c"; prev_t1t="$t1t"; prev_t2t="$t2t"
+        count=$((count + 1))
+
+        [ "$stop_monitor" -eq 1 ] && break
+        if [ "$samples" -gt 0 ] && [ "$count" -ge "$samples" ]; then
+            break
+        fi
+        sleep "$interval"
+    done
+
+    if [ -n "$prev_int_trap" ]; then
+        eval "$prev_int_trap"
+    else
+        trap - INT
+    fi
+
+    echo -e "${GREEN}温度观察结束。${NC}"
+    if [ -n "$csv_file" ]; then
+        echo -e "CSV 已保存: ${CYAN}$csv_file${NC}"
+        echo -e "可使用绘图脚本: ${BOLD}python3 scripts/plot_nvme_temperature.py --input \"$csv_file\"${NC}"
+    fi
+}
+
 # ----------------- 主程序入口 -----------------
 check_basic_cmds
 check_dependency_status
@@ -853,7 +991,7 @@ while true; do
     echo -e "  ${BLUE}1.${NC} 选择磁盘 ${GREEN}[低风险: 仅枚举设备]${NC}"
     echo -e "  ${BLUE}2.${NC} 查看寿命与健康度 ${GREEN}[低风险: 只读查询]${NC}"
     echo -e "  ${BLUE}3.${NC} 读写性能测试 ${YELLOW}[中风险: 写入临时文件, 默认不清缓存, RAID可选只读]${NC}"
-    
+    echo -e "  ${BLUE}5.${NC} NVMe 温度观察 ${GREEN}[低风险: 连续只读监控]${NC}"
     echo -e "  ${BLUE}4.${NC} ${RED}依赖管理(安装/卸载 smartmontools) [高风险: 系统配置变更]${NC}"
     
     echo -e "  ${RED}q.${NC} 退出脚本"
@@ -879,6 +1017,7 @@ while true; do
         2) check_health ;;
         3) test_speed ;;
         4) dependency_menu ;;
+        5) monitor_nvme_temperature ;;
         q|Q) exit 0 ;;
         *) echo "无效输入" ;;
     esac
