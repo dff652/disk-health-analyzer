@@ -487,62 +487,62 @@ check_health() {
         # 显示电源周期
         [ -n "$power_cycles" ] && echo -e "  开关次数: ${YELLOW}$(echo $power_cycles | tr -cd '0-9') 次${NC}"
         
-        # 显示温度 (使用 sensors 获取完整温度信息)
-        # 先获取 NVMe 的 PCI 地址，用于匹配 sensors 输出
-        local nvme_name=$(basename "$SELECTED_DISK" | sed 's/n1$//')  # nvme0 或 nvme1
-        local pci_slot=$(readlink -f /sys/class/nvme/$nvme_name 2>/dev/null | grep -oE 'pci[0-9]+:[0-9]+' | tail -1 | sed 's/pci//')
-        
-        # 尝试从 sensors 获取详细温度
-        local sensors_output=""
-        if command -v sensors &> /dev/null; then
-            # 查找对应的 hwmon 设备
-            sensors_output=$(sensors 2>/dev/null | grep -A10 "nvme-pci-0${pci_slot}00\|nvme-pci-${pci_slot}")
-            if [ -z "$sensors_output" ]; then
-                # 备用方案：按顺序匹配
-                local nvme_idx=$(echo "$nvme_name" | grep -oE '[0-9]+')
-                sensors_output=$(sensors 2>/dev/null | grep -A10 "nvme-pci" | head -$((11 * (nvme_idx + 1))) | tail -11)
-            fi
+        # 显示温度：优先使用当前 NVMe 设备的 hwmon，回退到 smartctl
+        local nvme_name=$(basename "$SELECTED_DISK" | sed -E 's/n[0-9]+$//')  # nvme0 / nvme1 / ...
+        local composite="" sensor1="" sensor2=""
+        local temp_input raw_temp temp_val idx label_file label
+
+        for temp_input in /sys/class/nvme/"$nvme_name"/device/hwmon/hwmon*/temp*_input; do
+            [ -f "$temp_input" ] || continue
+
+            raw_temp=$(cat "$temp_input" 2>/dev/null)
+            [[ "$raw_temp" =~ ^[0-9]+$ ]] || continue
+            temp_val=$(awk "BEGIN{printf \"%.1f\", $raw_temp/1000}")
+
+            idx=$(basename "$temp_input" | sed -E 's/temp([0-9]+)_input/\1/')
+            label_file="${temp_input%_input}_label"
+            label=""
+            [ -f "$label_file" ] && label=$(cat "$label_file" 2>/dev/null)
+
+            case "$(echo "$label" | tr '[:upper:]' '[:lower:]')" in
+                composite) composite="$temp_val" ;;
+                "sensor 1") sensor1="$temp_val" ;;
+                "sensor 2") sensor2="$temp_val" ;;
+                *)
+                    # 无 label 时，temp1 通常是 Composite
+                    [ "$idx" = "1" ] && [ -z "$composite" ] && composite="$temp_val"
+                    ;;
+            esac
+        done
+
+        # hwmon 不完整时，回退到 smartctl 同设备字段
+        [ -z "$composite" ] && composite=$(echo "$temperature" | tr -cd '0-9.')
+        [ -z "$sensor1" ] && sensor1=$(echo "$raw_smart" | grep -m1 -i "Temperature Sensor 1" | awk -F: '{print $2}' | tr -cd '0-9.')
+        [ -z "$sensor2" ] && sensor2=$(echo "$raw_smart" | grep -m1 -i "Temperature Sensor 2" | awk -F: '{print $2}' | tr -cd '0-9.')
+
+        if [ -n "$composite" ]; then
+            local comp_int=${composite%.*}
+            local comp_color=$GREEN
+            [ "$comp_int" -ge 50 ] && comp_color=$YELLOW
+            [ "$comp_int" -ge 70 ] && comp_color=$RED
+            echo -e "  综合温度: ${comp_color}${composite}°C${NC}"
         fi
-        
-        if [ -n "$sensors_output" ]; then
-            # 从 sensors 输出解析温度
-            local composite=$(echo "$sensors_output" | grep -i "Composite" | awk '{print $2}' | tr -cd '0-9.')
-            local sensor1=$(echo "$sensors_output" | grep -i "Sensor 1" | awk '{print $3}' | tr -cd '0-9.')
-            local sensor2=$(echo "$sensors_output" | grep -i "Sensor 2" | awk '{print $3}' | tr -cd '0-9.')
-            
-            # 显示综合温度
-            if [ -n "$composite" ]; then
-                local comp_int=${composite%.*}
-                local comp_color=$GREEN
-                [ "$comp_int" -ge 50 ] && comp_color=$YELLOW
-                [ "$comp_int" -ge 70 ] && comp_color=$RED
-                echo -e "  综合温度: ${comp_color}${composite}°C${NC}"
-            fi
-            
-            # 显示 Sensor 1 (通常是 NAND 闪存温度)
-            if [ -n "$sensor1" ]; then
-                local s1_int=${sensor1%.*}
-                local s1_color=$GREEN
-                [ "$s1_int" -ge 60 ] && s1_color=$YELLOW
-                [ "$s1_int" -ge 70 ] && s1_color=$RED
-                echo -e "  NAND温度: ${s1_color}${sensor1}°C${NC} (Sensor 1)"
-            fi
-            
-            # 显示 Sensor 2 (通常是主控温度)
-            if [ -n "$sensor2" ]; then
-                local s2_int=${sensor2%.*}
-                local s2_color=$GREEN
-                [ "$s2_int" -ge 60 ] && s2_color=$YELLOW
-                [ "$s2_int" -ge 70 ] && s2_color=$RED
-                echo -e "  主控温度: ${s2_color}${sensor2}°C${NC} (Sensor 2)"
-            fi
-        elif [ -n "$temperature" ]; then
-            # 回退到 smartctl 的单一温度
-            local temp_num=$(echo "$temperature" | tr -cd '0-9')
-            local temp_color=$GREEN
-            [ "$temp_num" -ge 50 ] && temp_color=$YELLOW
-            [ "$temp_num" -ge 70 ] && temp_color=$RED
-            echo -e "  当前温度: ${temp_color}${temp_num}°C${NC}"
+
+        # Sensor 1 / 2 为设备厂商定义，常见含义分别为 NAND/主控
+        if [ -n "$sensor1" ]; then
+            local s1_int=${sensor1%.*}
+            local s1_color=$GREEN
+            [ "$s1_int" -ge 60 ] && s1_color=$YELLOW
+            [ "$s1_int" -ge 70 ] && s1_color=$RED
+            echo -e "  NAND温度: ${s1_color}${sensor1}°C${NC} (Sensor 1)"
+        fi
+
+        if [ -n "$sensor2" ]; then
+            local s2_int=${sensor2%.*}
+            local s2_color=$GREEN
+            [ "$s2_int" -ge 60 ] && s2_color=$YELLOW
+            [ "$s2_int" -ge 70 ] && s2_color=$RED
+            echo -e "  主控温度: ${s2_color}${sensor2}°C${NC} (Sensor 2)"
         fi
         
         echo -e "------------------------------------------"
