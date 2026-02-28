@@ -13,6 +13,8 @@ NC='\033[0m'
 # 标记文件路径（用于判断是否由本脚本安装）
 INSTALL_FLAG="/etc/.smartctl_installed_by_script"
 SELECTED_DISK=""
+DISK_CANDIDATES=()
+SPEED_TEST_FILE=""
 
 # 检查权限
 if [ "$EUID" -ne 0 ]; then
@@ -22,7 +24,7 @@ fi
 
 # ----------------- 基础命令检查 -----------------
 check_basic_cmds() {
-    local cmds=("lsblk" "df" "awk" "grep" "bc" "dd")
+    local cmds=("lsblk" "df" "awk" "grep" "bc" "dd" "seq")
     for cmd in "${cmds[@]}"; do
         if ! command -v "$cmd" &> /dev/null; then
             echo -e "${RED}${BOLD}致命错误:${NC} 系统缺少基础命令: ${YELLOW}$cmd${NC}"
@@ -32,34 +34,63 @@ check_basic_cmds() {
     done
 }
 
-# ----------------- 依赖管理 (带保护逻辑) -----------------
-check_and_install_deps() {
-    if ! command -v smartctl &> /dev/null; then
-        echo -e "${YELLOW}------------------------------------------${NC}"
-        echo -e "${BOLD}检测到缺少关键依赖: ${CYAN}smartmontools${NC}"
-        read -p "是否由本脚本代为安装? (y/n): " confirm
-        if [[ "$confirm" == [yY] ]]; then
-            echo -e "${BLUE}正在安装...${NC}"
-            if command -v apt-get &> /dev/null; then
-                apt-get update && apt-get install -y smartmontools && touch "$INSTALL_FLAG"
-            elif command -v yum &> /dev/null; then
-                yum install -y smartmontools && touch "$INSTALL_FLAG"
-            elif command -v pacman &> /dev/null; then
-                pacman -Sy --noconfirm smartmontools && touch "$INSTALL_FLAG"
-            elif command -v apk &> /dev/null; then
-                apk add smartmontools && touch "$INSTALL_FLAG"
-            else
-                echo -e "${RED}未支持的包管理器，请手动安装 smartmontools。${NC}"
-            fi
-            [ -f "$INSTALL_FLAG" ] && echo -e "${GREEN}安装成功并已记录标记。${NC}"
+# ----------------- 依赖管理 (环境检查 + 手动决策) -----------------
+check_dependency_status() {
+    if command -v smartctl &> /dev/null; then
+        if [ -f "$INSTALL_FLAG" ]; then
+            echo -e "${GREEN}依赖状态:${NC} smartmontools 已安装（由本脚本安装）"
+        else
+            echo -e "${GREEN}依赖状态:${NC} smartmontools 已安装（系统或手动安装）"
         fi
+        return
+    fi
+
+    # smartctl 不存在但标记文件还在，说明可能是陈旧标记，启动时顺带清理。
+    [ -f "$INSTALL_FLAG" ] && rm -f "$INSTALL_FLAG"
+    echo -e "${YELLOW}依赖状态:${NC} 未安装 smartmontools（可在菜单 4 手动安装）"
+}
+
+install_deps() {
+    if command -v smartctl &> /dev/null; then
+        echo -e "${GREEN}smartmontools 已存在，无需安装。${NC}"
+        return
+    fi
+
+    echo -e "${RED}${BOLD}警告:${NC} 即将执行系统级安装操作。"
+    read -p "确认安装 smartmontools? (y/n): " confirm
+    if [[ "$confirm" != [yY] ]]; then
+        echo -e "${YELLOW}已取消安装。${NC}"
+        return
+    fi
+
+    echo -e "${BLUE}正在安装...${NC}"
+    if command -v apt-get &> /dev/null; then
+        apt-get update && apt-get install -y smartmontools && touch "$INSTALL_FLAG"
+    elif command -v yum &> /dev/null; then
+        yum install -y smartmontools && touch "$INSTALL_FLAG"
+    elif command -v pacman &> /dev/null; then
+        pacman -Sy --noconfirm smartmontools && touch "$INSTALL_FLAG"
+    elif command -v apk &> /dev/null; then
+        apk add smartmontools && touch "$INSTALL_FLAG"
     else
-        # 如果系统自带，确保没有标记文件，防止误删
-        [ -f "$INSTALL_FLAG" ] && rm -f "$INSTALL_FLAG"
+        echo -e "${RED}未支持的包管理器，请手动安装 smartmontools。${NC}"
+        return
+    fi
+
+    if command -v smartctl &> /dev/null; then
+        echo -e "${GREEN}安装成功并已记录标记。${NC}"
+    else
+        echo -e "${RED}安装失败，请检查包管理器输出。${NC}"
     fi
 }
 
 uninstall_deps() {
+    if ! command -v smartctl &> /dev/null; then
+        echo -e "${YELLOW}smartmontools 当前未安装，无需卸载。${NC}"
+        [ -f "$INSTALL_FLAG" ] && rm -f "$INSTALL_FLAG"
+        return
+    fi
+
     if [ ! -f "$INSTALL_FLAG" ]; then
         echo -e "${RED}拒绝操作：检测到 smartmontools 是系统自带或手动安装的，脚本无权卸载。${NC}"
         return
@@ -81,6 +112,32 @@ uninstall_deps() {
     fi
 }
 
+dependency_menu() {
+    while true; do
+        echo -e "\n${CYAN}----------- 依赖管理 (高风险) -----------${NC}"
+        if command -v smartctl &> /dev/null; then
+            if [ -f "$INSTALL_FLAG" ]; then
+                echo -e "  当前状态: ${GREEN}已安装${NC} (由脚本安装)"
+            else
+                echo -e "  当前状态: ${GREEN}已安装${NC} (系统/手动安装)"
+            fi
+        else
+            echo -e "  当前状态: ${YELLOW}未安装${NC}"
+        fi
+        echo -e "  ${BLUE}1.${NC} 安装 smartmontools"
+        echo -e "  ${BLUE}2.${NC} 卸载脚本安装的 smartmontools"
+        echo -e "  ${BLUE}b.${NC} 返回主菜单"
+        read -p "请输入选项: " dep_opt
+
+        case $dep_opt in
+            1) install_deps ;;
+            2) uninstall_deps ;;
+            b|B) break ;;
+            *) echo -e "${RED}无效输入${NC}" ;;
+        esac
+    done
+}
+
 # ----------------- 进度条绘制 -----------------
 draw_progress() {
     local percent=$1
@@ -99,29 +156,269 @@ draw_progress() {
     printf "${BOLD}%-15s${NC}: ${color}[%s] %d%%${NC}\n" "$label" "$bar" "$percent"
 }
 
+health_color_for_status() {
+    local status="$1"
+    if echo "$status" | grep -qiE 'OK|PASSED|GOOD|HEALTHY'; then
+        echo "$GREEN"
+    elif echo "$status" | grep -qiE 'FAIL|FAILED|BAD|CRIT|ERROR|DEGRADED'; then
+        echo "$RED"
+    else
+        echo "$YELLOW"
+    fi
+}
+
+cleanup_speed_test_file() {
+    [ -n "$SPEED_TEST_FILE" ] && rm -f "$SPEED_TEST_FILE" 2>/dev/null
+}
+
+clear_speed_test_cleanup() {
+    trap - INT TERM EXIT
+    SPEED_TEST_FILE=""
+}
+
+apply_cache_policy() {
+    local mode="$1"
+    sync
+    if [ "$mode" = "drop" ]; then
+        echo 3 > /proc/sys/vm/drop_caches 2>/dev/null
+    fi
+}
+
+# ----------------- RAID 检测与提示 -----------------
+is_raid_model() {
+    local model="$1"
+    echo "$model" | grep -qiE 'PERC|MegaRAID|RAID|Virtual Disk'
+}
+
+show_raid_notice() {
+    local disk="$1"
+    local model="$2"
+    echo -e "${YELLOW}${BOLD}提示:${NC} 当前选择的是 RAID 控制器导出的逻辑盘。"
+    echo -e "  设备: ${CYAN}${disk}${NC}  型号: ${CYAN}${model}${NC}"
+    echo -e "  这不是单块物理硬盘，健康信息可能与实际物理盘不一一对应。"
+    echo -e "  若需逐块物理盘诊断，请使用 ${BOLD}perccli/storcli${NC}，或 smartctl 的 ${BOLD}-d megaraid,N${NC}。"
+}
+
+show_raid_scope_notice() {
+    if command -v perccli64 &> /dev/null || command -v perccli &> /dev/null || command -v storcli64 &> /dev/null || command -v storcli &> /dev/null; then
+        echo -e "  ${YELLOW}提示:${NC} 当前为控制器级扫描结果。若需“逻辑盘->物理盘”精确映射，请结合 perccli/storcli。"
+    else
+        echo -e "  ${YELLOW}提示:${NC} 当前为控制器级扫描，可能包含其他逻辑盘成员；未安装 perccli/storcli 时无法精确映射。"
+    fi
+}
+
+is_valid_raid_smart_output() {
+    local raw="$1"
+    echo "$raw" | grep -qiE "Device Id:|Serial Number:|Model Number:|Device Model:|Product:|SMART support is:|SMART Health Status:|Percentage Used:|Power_On_Hours|Rotation Rate:"
+}
+
+fetch_raid_smart() {
+    local disk="$1"
+    local idx="$2"
+    local raw=""
+
+    raw=$(smartctl -a -d "megaraid,$idx" "$disk" 2>/dev/null)
+    if is_valid_raid_smart_output "$raw"; then
+        echo "$raw"
+        return 0
+    fi
+
+    raw=$(smartctl -a -d "sat+megaraid,$idx" "$disk" 2>/dev/null)
+    if is_valid_raid_smart_output "$raw"; then
+        echo "$raw"
+        return 0
+    fi
+
+    return 1
+}
+
+check_raid_physical_health() {
+    local disk="$1"
+    local found=0
+    local miss_after_found=0
+    local idx raw_smart
+
+    if ! command -v smartctl &> /dev/null; then
+        echo -e "  ${RED}错误: 未安装 smartmontools${NC}"
+        echo -e "  ${YELLOW}请在主菜单 4 手动安装，或通过包管理器安装${NC}"
+        return
+    fi
+
+    echo -e "  磁盘类型: ${CYAN}RAID 逻辑盘（尝试枚举物理盘 SMART）${NC}"
+    echo -e "  ${YELLOW}扫描范围: megaraid,0..31 (只读)${NC}"
+    show_raid_scope_notice
+    echo -e "------------------------------------------"
+
+    for idx in $(seq 0 31); do
+        raw_smart=$(fetch_raid_smart "$disk" "$idx")
+        if [ -z "$raw_smart" ]; then
+            if [ "$found" -eq 1 ]; then
+                miss_after_found=$((miss_after_found + 1))
+                [ "$miss_after_found" -ge 8 ] && break
+            fi
+            continue
+        fi
+
+        found=1
+        miss_after_found=0
+
+        local device_id model vendor serial rotation media health power_hours pct_used temperature
+        device_id=$(echo "$raw_smart" | grep -m1 -i "^Device Id:" | awk -F: '{print $2}' | xargs)
+        [ -z "$device_id" ] && device_id="$idx"
+
+        model=$(echo "$raw_smart" | grep -m1 -iE "^(Model Number|Device Model|Product):" | awk -F: '{print $2}' | xargs)
+        vendor=$(echo "$raw_smart" | grep -m1 -i "^Vendor:" | awk -F: '{print $2}' | xargs)
+        [ -z "$model" ] && model="$vendor"
+        [ -z "$model" ] && model="未知"
+
+        serial=$(echo "$raw_smart" | grep -m1 -i "^Serial Number:" | awk -F: '{print $2}' | xargs)
+        [ -z "$serial" ] && serial="未知"
+
+        rotation=$(echo "$raw_smart" | grep -m1 -i "^Rotation Rate:" | awk -F: '{print $2}' | xargs)
+        pct_used=$(echo "$raw_smart" | grep -m1 -i "Percentage Used" | awk -F: '{print $2}' | tr -d '% ' | tr -cd '0-9')
+        power_hours=$(echo "$raw_smart" | grep -m1 -i "Power_On_Hours" | awk '{print $NF}' | tr -cd '0-9')
+        [ -z "$power_hours" ] && power_hours=$(echo "$raw_smart" | grep -m1 -i "Power on Hours" | awk -F: '{print $2}' | tr -cd '0-9')
+
+        health=$(echo "$raw_smart" | grep -m1 -iE "SMART overall-health self-assessment test result|SMART Health Status" | awk -F: '{print $2}' | xargs)
+        [ -z "$health" ] && health="未知"
+
+        temperature=$(echo "$raw_smart" | grep -m1 -i "Current Drive Temperature" | awk -F: '{print $2}' | tr -cd '0-9')
+        [ -z "$temperature" ] && temperature=$(echo "$raw_smart" | grep -m1 -i "Temperature_Celsius" | awk '{print $10}' | tr -cd '0-9')
+        [ -z "$temperature" ] && temperature=$(echo "$raw_smart" | grep -m1 -i "^Temperature:" | awk -F: '{print $2}' | tr -cd '0-9')
+
+        media="未知"
+        if echo "$rotation" | grep -qi "Solid State"; then
+            media="SSD"
+        elif echo "$rotation" | grep -qi "rpm"; then
+            media="HDD (${rotation})"
+        elif [ -n "$pct_used" ]; then
+            media="SSD (推断)"
+        fi
+
+        local health_color
+        health_color=$(health_color_for_status "$health")
+
+        echo -e "  ${BOLD}物理盘槽位 megaraid,${device_id}${NC}"
+        echo -e "    型号: ${PURPLE}${model}${NC}"
+        echo -e "    序列号: ${CYAN}${serial}${NC}"
+        echo -e "    介质类型: ${YELLOW}${media}${NC}"
+        echo -e "    健康状态: ${health_color}${health}${NC}"
+        [ -n "$power_hours" ] && echo -e "    通电时间: ${YELLOW}${power_hours} 小时${NC}"
+        [ -n "$temperature" ] && echo -e "    温度: ${YELLOW}${temperature}°C${NC}"
+
+        if [ -n "$pct_used" ]; then
+            local remaining=$((100 - pct_used))
+            [ "$remaining" -lt 0 ] && remaining=0
+            [ "$remaining" -gt 100 ] && remaining=100
+            draw_progress "$pct_used" "寿命已用"
+            echo -e "    剩余健康度: ${GREEN}${remaining}%${NC}"
+        fi
+        echo -e "------------------------------------------"
+    done
+
+    if [ "$found" -eq 0 ]; then
+        echo -e "  ${RED}未扫描到可解析的 RAID 物理盘 SMART 信息。${NC}"
+        echo -e "  ${YELLOW}可手动尝试: smartctl -a -d megaraid,0 ${disk}${NC}"
+        echo -e "  ${YELLOW}若仍失败，建议安装 perccli/storcli 查看控制器物理盘信息。${NC}"
+    fi
+}
+
+is_risky_speed_mount() {
+    local mp="$1"
+    case "$mp" in
+        /boot|/boot/*|/efi|/efi/*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+choose_speed_test_mountpoint() {
+    local disk="$1"
+    local min_free_mb=200
+    local mp avail
+    local best_mp=""
+    local best_avail=0
+
+    while IFS= read -r mp; do
+        [ -z "$mp" ] && continue
+        [ "$mp" = "[SWAP]" ] && continue
+        [ ! -d "$mp" ] && continue
+        [ ! -w "$mp" ] && continue
+        is_risky_speed_mount "$mp" && continue
+
+        avail=$(df -Pm "$mp" 2>/dev/null | awk 'NR==2 {print $4}')
+        [[ "$avail" =~ ^[0-9]+$ ]] || continue
+
+        if [ "$avail" -ge "$min_free_mb" ] && [ "$avail" -gt "$best_avail" ]; then
+            best_avail="$avail"
+            best_mp="$mp"
+        fi
+    done < <(lsblk -n -o MOUNTPOINT "$disk" "$disk"* 2>/dev/null | awk 'NF' | sort -u)
+
+    [ -n "$best_mp" ] && { echo "$best_mp"; return 0; }
+    return 1
+}
+
+# ----------------- 磁盘列表（过滤虚拟设备） -----------------
+list_selectable_disks() {
+    DISK_CANDIDATES=()
+    local name size type model
+
+    while read -r name size type model; do
+        [ -z "$name" ] && continue
+        [ "$type" != "disk" ] && continue
+        case "$name" in
+            loop*|ram*|zram*) continue ;;
+        esac
+
+        DISK_CANDIDATES+=("$name")
+        if is_raid_model "$model"; then
+            printf "%d) /dev/%s [%s] %s [RAID逻辑盘]\n" "${#DISK_CANDIDATES[@]}" "$name" "$size" "$model"
+        else
+            printf "%d) /dev/%s [%s] %s\n" "${#DISK_CANDIDATES[@]}" "$name" "$size" "$model"
+        fi
+    done < <(lsblk -d -n -o NAME,SIZE,TYPE,MODEL 2>/dev/null)
+
+    if [ "${#DISK_CANDIDATES[@]}" -eq 0 ]; then
+        echo -e "${RED}未发现可用的物理磁盘设备。${NC}"
+    fi
+}
+
 # ----------------- 健康度解析 -----------------
 check_health() {
     [ -z "$SELECTED_DISK" ] && { echo -e "${RED}请先选择磁盘！${NC}"; return; }
     
     # 获取容量信息
     local total_size=$(lsblk -d -n -o SIZE "$SELECTED_DISK")
-    # 获取挂载点的使用情况 (如果是多分区，取根目录或主要分区)
-    local usage_info=$(df -h | grep "$SELECTED_DISK" | head -n 1)
-    local used_size=$(echo $usage_info | awk '{print $3}')
-    local free_size=$(echo $usage_info | awk '{print $4}')
-    [ -z "$used_size" ] && used_size="未知"
-    [ -z "$free_size" ] && free_size="未知"
 
     echo -e "\n${BLUE}${BOLD}┏━━━━ 磁盘详细健康档案 ━━━━┓${NC}"
     echo -e "  设备路径: ${YELLOW}$SELECTED_DISK${NC}"
     echo -e "  总 容 量: ${CYAN}$total_size${NC}"
     echo -e "------------------------------------------"
 
+    local selected_model=$(lsblk -d -n -o MODEL "$SELECTED_DISK" 2>/dev/null | xargs)
+    if is_raid_model "$selected_model"; then
+        show_raid_notice "$SELECTED_DISK" "${selected_model:-未知}"
+        echo -e "------------------------------------------"
+        check_raid_physical_health "$SELECTED_DISK"
+        echo -e "${BLUE}${BOLD}┗━━━━━━━━━━━━━━━━━━━━━━━━┛${NC}"
+        return
+    fi
+
     if [[ "$SELECTED_DISK" == *"/mmcblk"* ]]; then
         # ===================== eMMC 逻辑 =====================
         local sys_path lifetime val_a val_b max_val
         echo -e "  磁盘类型: ${CYAN}eMMC 存储${NC}"
-        sys_path=$(find /sys/bus/mmc/devices/ -name "*:*" 2>/dev/null | head -n 1)
+        local disk_base=$(basename "$SELECTED_DISK")
+        sys_path="/sys/block/$disk_base/device"
+
+        if [ ! -f "$sys_path/life_time" ]; then
+            # 回退方案：按 mmc 主机号在 /sys/bus/mmc/devices 下查找
+            local mmc_host=$(readlink -f "/sys/block/$disk_base/device" 2>/dev/null | grep -oE 'mmc[0-9]+' | head -n 1)
+            if [ -n "$mmc_host" ]; then
+                sys_path=$(find /sys/bus/mmc/devices/ -maxdepth 1 -type d -name "${mmc_host}:*" 2>/dev/null | head -n 1)
+            fi
+        fi
+
         if [ -n "$sys_path" ] && [ -f "$sys_path/life_time" ]; then
             lifetime=$(cat "$sys_path/life_time")
             val_a=$(( $(echo $lifetime | awk '{print $1}') ))
@@ -129,7 +426,10 @@ check_health() {
             draw_progress "$((val_a * 10))" "SLC 区域消耗"
             draw_progress "$((val_b * 10))" "MLC 区域消耗"
             max_val=$((val_b > val_a ? val_b : val_a))
-            echo -e "  ${BOLD}估算剩余寿命: ${GREEN}$((100 - max_val * 10))%${NC}"
+            local emmc_remaining=$((100 - max_val * 10))
+            [ "$emmc_remaining" -lt 0 ] && emmc_remaining=0
+            [ "$emmc_remaining" -gt 100 ] && emmc_remaining=100
+            echo -e "  ${BOLD}估算剩余寿命: ${GREEN}${emmc_remaining}%${NC}"
         else
             echo -e "  ${RED}错误: 无法读取 eMMC 寿命节点${NC}"
         fi
@@ -140,7 +440,7 @@ check_health() {
         
         if ! command -v smartctl &> /dev/null; then
             echo -e "  ${RED}错误: 未安装 smartmontools${NC}"
-            echo -e "  ${YELLOW}请运行自动安装或通过包管理器安装${NC}"
+            echo -e "  ${YELLOW}请在主菜单 4 手动安装，或通过包管理器安装${NC}"
             echo -e "${BLUE}${BOLD}┗━━━━━━━━━━━━━━━━━━━━━━━━┛${NC}"
             return
         fi
@@ -253,6 +553,8 @@ check_health() {
             if [ -n "$pct_num" ]; then
                 draw_progress "$pct_num" "寿命已用"
                 local remaining=$((100 - pct_num))
+                [ "$remaining" -lt 0 ] && remaining=0
+                [ "$remaining" -gt 100 ] && remaining=100
                 local health_color=$GREEN
                 [ "$remaining" -le 30 ] && health_color=$YELLOW
                 [ "$remaining" -le 10 ] && health_color=$RED
@@ -284,7 +586,7 @@ check_health() {
         
         if ! command -v smartctl &> /dev/null; then
             echo -e "  ${RED}错误: 未安装 smartmontools${NC}"
-            echo -e "  ${YELLOW}请运行自动安装或通过包管理器安装${NC}"
+            echo -e "  ${YELLOW}请在主菜单 4 手动安装，或通过包管理器安装${NC}"
             echo -e "${BLUE}${BOLD}┗━━━━━━━━━━━━━━━━━━━━━━━━┛${NC}"
             return
         fi
@@ -357,31 +659,122 @@ test_speed() {
     
     echo -e "\n${PURPLE}--- 性能测试 (100MB) ---${NC}"
     echo -e "  选中磁盘: ${YELLOW}$SELECTED_DISK${NC}"
-    
-    # 查找磁盘或其分区的挂载点
-    local mount_point=""
-    # 先检查磁盘本身是否挂载
-    mount_point=$(lsblk -n -o MOUNTPOINT "$SELECTED_DISK" 2>/dev/null | grep -v "^$" | head -n 1)
-    # 如果磁盘本身未挂载，检查其分区
-    if [ -z "$mount_point" ]; then
-        mount_point=$(lsblk -n -o MOUNTPOINT "$SELECTED_DISK"* 2>/dev/null | grep -v "^$" | grep -v "\[SWAP\]" | head -n 1)
+    local selected_model=$(lsblk -d -n -o MODEL "$SELECTED_DISK" 2>/dev/null | xargs)
+    local speed_mode="rw"
+    local cache_mode="safe"
+    local is_raid=0
+
+    if is_raid_model "$selected_model"; then
+        is_raid=1
+        echo -e "${YELLOW}${BOLD}RAID 风险提示:${NC} 当前是 RAID 逻辑盘，测速会对阵列产生 I/O 压力。"
+        read -p "是否继续测速? (y/n): " confirm_raid
+        if [[ "$confirm_raid" != [yY] ]]; then
+            echo -e "${YELLOW}已取消测速。${NC}"
+            return
+        fi
+
+        echo -e "  请选择 RAID 测速模式:"
+        echo -e "    1) 只读测速 ${GREEN}[推荐: 不写入文件，不清缓存]${NC}"
+        echo -e "    2) 读写测速 ${YELLOW}[会写入临时文件并清缓存]${NC}"
+        read -p "请输入模式编号 [1/2, 默认1]: " mode_opt
+        case "$mode_opt" in
+            2) speed_mode="rw" ;;
+            *) speed_mode="ro" ;;
+        esac
+
+        if [ "$speed_mode" = "rw" ]; then
+            read -p "确认执行 RAID 读写测速? (y/n): " confirm_rw
+            if [[ "$confirm_rw" != [yY] ]]; then
+                echo -e "${YELLOW}已取消测速。${NC}"
+                return
+            fi
+
+            echo -e "  请选择缓存策略:"
+            echo -e "    1) 不清缓存 ${GREEN}[推荐: 在线业务更稳]${NC}"
+            echo -e "    2) 清缓存 ${YELLOW}[更接近裸盘, 但会影响整机缓存]${NC}"
+            read -p "请输入策略编号 [1/2, 默认1]: " cache_opt
+            case "$cache_opt" in
+                2) cache_mode="drop" ;;
+                *) cache_mode="safe" ;;
+            esac
+        fi
+    fi
+
+    # 非 RAID：读写测速前增加确认和缓存策略选择
+    if [ "$is_raid" -eq 0 ]; then
+        echo -e "${YELLOW}${BOLD}风险提示:${NC} 即将执行读写测速，会在挂载点写入 100MB 临时文件。"
+        read -p "确认继续? (y/n): " confirm_nonraid_rw
+        if [[ "$confirm_nonraid_rw" != [yY] ]]; then
+            echo -e "${YELLOW}已取消测速。${NC}"
+            return
+        fi
+
+        echo -e "  请选择缓存策略:"
+        echo -e "    1) 不清缓存 ${GREEN}[推荐: 在线业务更稳]${NC}"
+        echo -e "    2) 清缓存 ${YELLOW}[更接近裸盘, 但会影响整机缓存]${NC}"
+        read -p "请输入策略编号 [1/2, 默认1]: " cache_opt
+        case "$cache_opt" in
+            2) cache_mode="drop" ;;
+            *) cache_mode="safe" ;;
+        esac
+    fi
+
+    if [ "$speed_mode" = "ro" ]; then
+        echo -e "  测速模式: ${GREEN}只读测速${NC}"
+        echo -e "  读取目标: ${CYAN}$SELECTED_DISK${NC} (原始块设备)"
+        echo -e "------------------------------------------"
+
+        sync
+        echo -n "  读取速度(只读): "
+        local read_result
+        read_result=$(dd if="$SELECTED_DISK" of=/dev/null bs=1M count=100 iflag=direct 2>&1)
+        if [ $? -ne 0 ]; then
+            echo -e "\n  ${YELLOW}direct 读取失败，回退标准读取模式...${NC}"
+            read_result=$(dd if="$SELECTED_DISK" of=/dev/null bs=1M count=100 2>&1)
+        fi
+        local read_speed=$(echo "$read_result" | grep -oE '[0-9.]+ [MG]B/s' | tail -1)
+        if [ -n "$read_speed" ]; then
+            echo -e "${GREEN}$read_speed${NC}"
+        else
+            local read_time=$(echo "$read_result" | grep -oE '[0-9.]+ s,' | head -1 | tr -d ' s,')
+            if [ -n "$read_time" ] && [ "$read_time" != "0" ]; then
+                local calc_speed=$(echo "scale=2; 100 / $read_time" | bc 2>/dev/null)
+                echo -e "${GREEN}${calc_speed:-未知} MB/s${NC}"
+            else
+                echo -e "${RED}测试失败${NC}"
+            fi
+        fi
+
+        echo -e "------------------------------------------"
+        echo -e "${GREEN}只读测速完成！${NC}"
+        return
     fi
     
+    # 选择安全的测速挂载点（避免 /boot/efi 等引导分区）
+    local mount_point=""
+    mount_point=$(choose_speed_test_mountpoint "$SELECTED_DISK")
+    
     if [ -z "$mount_point" ]; then
-        echo -e "${RED}错误: 磁盘 $SELECTED_DISK 及其分区均未挂载！${NC}"
-        echo -e "${YELLOW}提示: 请先挂载磁盘分区，或选择一个已挂载的磁盘。${NC}"
-        echo -e "可用挂载点参考:"
-        df -h | grep -E "^/dev" | awk '{print "  "$1" -> "$6}'
+        echo -e "${RED}错误: 未找到适合写入测速的安全挂载点。${NC}"
+        echo -e "${YELLOW}已自动排除引导分区（如 /boot/efi），并要求挂载点可写且剩余空间 >= 200MB。${NC}"
+        echo -e "可见挂载点参考:"
+        lsblk -n -o MOUNTPOINT "$SELECTED_DISK" "$SELECTED_DISK"* 2>/dev/null | awk 'NF {print "  "$1}'
         return
     fi
     
     local test_file="$mount_point/.speed_test_tmp_$$"
+    SPEED_TEST_FILE="$test_file"
+    trap cleanup_speed_test_file INT TERM EXIT
     echo -e "  测试路径: ${CYAN}$test_file${NC}"
+    if [ "$cache_mode" = "drop" ]; then
+        echo -e "  缓存策略: ${YELLOW}清缓存${NC}"
+    else
+        echo -e "  缓存策略: ${GREEN}不清缓存${NC}"
+    fi
     echo -e "------------------------------------------"
     
-    # 清除缓存
-    sync
-    echo 3 > /proc/sys/vm/drop_caches 2>/dev/null
+    # 按策略处理缓存
+    apply_cache_policy "$cache_mode"
     
     # 尝试使用 fio 测试（如果存在）以获取更精确的数据，回退到 dd
     if command -v fio &> /dev/null; then
@@ -389,13 +782,14 @@ test_speed() {
         local fio_write=$(fio --name=write_test --filename="$test_file" --size=100M --rw=write --bs=1M --direct=1 --numjobs=1 --ioengine=libaio --iodepth=1 2>&1 | grep -o 'BW=[0-9.]*[A-Za-z]B/s' | grep -o '[0-9.]*[A-Za-z]B/s')
         echo -e "${GREEN}${fio_write:-测试失败}${NC}"
         
-        sync; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null
+        apply_cache_policy "$cache_mode"
         
         echo -n "  读取速度(fio): "
         local fio_read=$(fio --name=read_test --filename="$test_file" --size=100M --rw=read --bs=1M --direct=1 --numjobs=1 --ioengine=libaio --iodepth=1 2>&1 | grep -o 'BW=[0-9.]*[A-Za-z]B/s' | grep -o '[0-9.]*[A-Za-z]B/s')
         echo -e "${GREEN}${fio_read:-测试失败}${NC}"
         
-        rm -f "$test_file" 2>/dev/null
+        cleanup_speed_test_file
+        clear_speed_test_cleanup
         echo -e "------------------------------------------"
         echo -e "${GREEN}完成！${NC}"
         return
@@ -418,9 +812,8 @@ test_speed() {
         fi
     fi
     
-    # 清除缓存后进行读取测试
-    sync
-    echo 3 > /proc/sys/vm/drop_caches 2>/dev/null
+    # 按策略处理缓存后进行读取测试
+    apply_cache_policy "$cache_mode"
     
     # 读取测试
     echo -n "  读取速度: "
@@ -443,42 +836,49 @@ test_speed() {
     fi
     
     # 清理测试文件
-    rm -f "$test_file" 2>/dev/null
+    cleanup_speed_test_file
+    clear_speed_test_cleanup
     echo -e "------------------------------------------"
     echo -e "${GREEN}测试完成！${NC}"
 }
 
 # ----------------- 主程序入口 -----------------
 check_basic_cmds
-check_and_install_deps
+check_dependency_status
 
 while true; do
     echo -e "\n${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo -e "  ${BOLD}磁盘管理专家${NC} (当前: ${YELLOW}${SELECTED_DISK:-未选择}${NC})"
     echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "  ${BLUE}1.${NC} 选择磁盘"
-    echo -e "  ${BLUE}2.${NC} 查看寿命与健康度"
-    echo -e "  ${BLUE}3.${NC} 读写性能测试"
+    echo -e "  ${BLUE}1.${NC} 选择磁盘 ${GREEN}[低风险: 仅枚举设备]${NC}"
+    echo -e "  ${BLUE}2.${NC} 查看寿命与健康度 ${GREEN}[低风险: 只读查询]${NC}"
+    echo -e "  ${BLUE}3.${NC} 读写性能测试 ${YELLOW}[中风险: 写入临时文件, 默认不清缓存, RAID可选只读]${NC}"
     
-    # 核心逻辑：只有存在标记文件时，才显示“卸载”选项
-    if [ -f "$INSTALL_FLAG" ]; then
-        echo -e "  ${BLUE}4.${NC} ${RED}卸载脚本安装的依赖${NC}"
-    fi
+    echo -e "  ${BLUE}4.${NC} ${RED}依赖管理(安装/卸载 smartmontools) [高风险: 系统配置变更]${NC}"
     
     echo -e "  ${RED}q.${NC} 退出脚本"
+    echo -e "  ${CYAN}风险说明: 低=只读查询 | 中=有写入与缓存影响 | 高=系统级改动${NC}"
     echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     read -p "请输入选项: " opt
     
     case $opt in
         1) 
-            lsblk -d -n -o NAME,SIZE,MODEL | awk '{print NR") /dev/"$1 " ["$2"] " $3}'
+            list_selectable_disks
+            [ "${#DISK_CANDIDATES[@]}" -eq 0 ] && continue
             read -p "选择编号: " choice
-            line=$(lsblk -d -n -o NAME | sed -n "${choice}p")
-            [ ! -z "$line" ] && SELECTED_DISK="/dev/$line"
+            if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#DISK_CANDIDATES[@]}" ]; then
+                SELECTED_DISK="/dev/${DISK_CANDIDATES[$((choice - 1))]}"
+                selected_model=$(lsblk -d -n -o MODEL "$SELECTED_DISK" 2>/dev/null | xargs)
+                if is_raid_model "$selected_model"; then
+                    show_raid_notice "$SELECTED_DISK" "${selected_model:-未知}"
+                fi
+            else
+                echo -e "${RED}无效编号${NC}"
+            fi
             ;;
         2) check_health ;;
         3) test_speed ;;
-        4) [ -f "$INSTALL_FLAG" ] && uninstall_deps || echo "无效选项" ;;
+        4) dependency_menu ;;
         q|Q) exit 0 ;;
         *) echo "无效输入" ;;
     esac
